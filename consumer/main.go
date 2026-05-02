@@ -1,70 +1,61 @@
 package main
 
 import (
-	"context"
 	"log"
+	"os"
+	"os/signal"
 	"sync"
-	"time"
+	"syscall"
 
-	"github.com/apache/pulsar-client-go/pulsar"
+	eventlib "gitlab.smartfren.com/sharedproject/event-publisher/eventlib"
+	clientlib "gitlab.smartfren.com/sharedproject/event-publisher/eventlib/client"
+	cm "gitlab.smartfren.com/sharedproject/event-publisher/eventlib/common"
 )
 
 const (
-	pulsarURL    = "pulsar://172.29.88.203:6650"
+	pulsarURL    = "pulsar://172.29.50.54:6650"
 	topic        = "persistent://public/default/demo-redelivery"
 	subscription = "demo-sub"
 )
 
 func main() {
-	client, err := pulsar.NewClient(pulsar.ClientOptions{
-		URL:               pulsarURL,
-		OperationTimeout:  30 * time.Second,
-		ConnectionTimeout: 30 * time.Second,
-	})
-	if err != nil {
-		log.Fatalf("could not create pulsar client: %v", err)
+	cfg := &cm.Configuration{
+		ClientType:              "pulsar",
+		Host:                    pulsarURL,
+		AllowInsecureConnection: true,
 	}
-	defer client.Close()
 
-	consumer, err := client.Subscribe(pulsar.ConsumerOptions{
-		Topic:            topic,
-		SubscriptionName: subscription,
-		Type:             pulsar.Shared,
-		// Nacked messages akan dikirim ulang setelah 3 detik
-		NackRedeliveryDelay: 3 * time.Second,
-	})
+	evClient, err := eventlib.NewClient(cfg)
 	if err != nil {
-		log.Fatalf("could not subscribe: %v", err)
+		log.Fatalf("could not create client: %v", err)
 	}
-	defer consumer.Close()
+	defer evClient.Close()
 
-	log.Println("[CONSUMER] waiting for messages... (Ctrl+C to stop)")
+	subscriber := evClient.CreateSubscriber(subscription)
+	defer subscriber.Close()
 
-	// seen menyimpan message ID string yang sudah di-nack (attempt pertama)
 	var seen sync.Map
 
-	ctx := context.Background()
-	for {
-		msg, err := consumer.Receive(ctx)
-		if err != nil {
-			log.Printf("[CONSUMER] receive error: %v", err)
-			return
-		}
-
-		key := msg.ID().String()
-		payload := string(msg.Payload())
+	if err := subscriber.SubscribeV2(topic, clientlib.Shared, false, func(msg clientlib.Message, ack func(ok bool)) {
+		key := string(msg.ID)
+		payload := string(msg.Payload)
 
 		if _, alreadyNacked := seen.LoadOrStore(key, true); !alreadyNacked {
-			// Attempt pertama: sengaja NACK supaya Pulsar kirim ulang
-			log.Printf("[CONSUMER] ATTEMPT-1 received: %q  msgID=%v  → NACK (tidak di-ack, akan dikirim ulang)", payload, key)
-			consumer.Nack(msg)
+			log.Printf("[CONSUMER] ATTEMPT-1 received: %q  msgID=%x  → NACK (akan dikirim ulang)", payload, msg.ID)
+			ack(false)
 		} else {
-			// Attempt kedua (redelivery): ack sekarang
-			log.Printf("[CONSUMER] ATTEMPT-2 redelivered: %q  msgID=%v  → ACK", payload, key)
-			if err := consumer.Ack(msg); err != nil {
-				log.Printf("[CONSUMER] ack error: %v", err)
-			}
+			log.Printf("[CONSUMER] ATTEMPT-2 redelivered: %q  msgID=%x  → ACK", payload, msg.ID)
+			ack(true)
 			seen.Delete(key)
 		}
+	}); err != nil {
+		log.Fatalf("could not subscribe: %v", err)
 	}
+
+	log.Println("[CONSUMER] waiting for messages... (Ctrl+C to stop)")
+	go subscriber.Start()
+
+	terminate := make(chan os.Signal, 1)
+	signal.Notify(terminate, os.Interrupt, syscall.SIGTERM)
+	<-terminate
 }
